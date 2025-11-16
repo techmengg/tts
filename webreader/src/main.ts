@@ -8,6 +8,22 @@ type Location = {
   }
 }
 
+type AuthUser = {
+  id: string
+  email: string
+  displayName: string
+  createdAt?: string
+}
+
+type SessionPayload = {
+  token: string
+  user: AuthUser
+}
+
+const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://localhost:4000'
+const SESSION_KEY = 'mono-reader-session'
+let session: SessionPayload | null = null
+
 const root = document.querySelector<HTMLDivElement>('#app')
 if (!root) {
   throw new Error('App container missing')
@@ -15,7 +31,42 @@ if (!root) {
 
 root.innerHTML = `
   <main class="canvas" aria-live="polite">
-    <div class="drop-hint" id="dropHint">drop your .epub anywhere</div>
+    <div class="drop-hint" id="dropHint">sign in to drop your .epub anywhere</div>
+    <section class="auth" id="authShell">
+      <div class="auth-meta">
+        <p class="auth-greeting" id="userGreeting">guest mode</p>
+        <button type="button" class="ghost" id="logoutBtn" aria-label="Sign out">logout</button>
+      </div>
+      <p class="auth-message" id="authMessage">sign in to unlock the reader</p>
+      <div class="form-row">
+        <form class="auth-form" id="registerForm" autocomplete="off">
+          <label>
+            <span>handle</span>
+            <input type="text" name="displayName" minlength="2" maxlength="80" required />
+          </label>
+          <label>
+            <span>email</span>
+            <input type="email" name="email" required />
+          </label>
+          <label>
+            <span>password</span>
+            <input type="password" name="password" minlength="8" required />
+          </label>
+          <button type="submit" class="ghost">create</button>
+        </form>
+        <form class="auth-form" id="loginForm" autocomplete="off">
+          <label>
+            <span>email</span>
+            <input type="email" name="email" required />
+          </label>
+          <label>
+            <span>password</span>
+            <input type="password" name="password" minlength="8" required />
+          </label>
+          <button type="submit" class="ghost">login</button>
+        </form>
+      </div>
+    </section>
     <header class="intro">
       <div>
         <p class="eyebrow">mono shelf</p>
@@ -37,6 +88,12 @@ root.innerHTML = `
   </main>
 `
 
+const authShell = root.querySelector<HTMLElement>('#authShell')!
+const authMessage = root.querySelector<HTMLParagraphElement>('#authMessage')!
+const userGreeting = root.querySelector<HTMLParagraphElement>('#userGreeting')!
+const logoutBtn = root.querySelector<HTMLButtonElement>('#logoutBtn')!
+const registerForm = root.querySelector<HTMLFormElement>('#registerForm')!
+const loginForm = root.querySelector<HTMLFormElement>('#loginForm')!
 const fileInput = root.querySelector<HTMLInputElement>('#epubInput')!
 const statusEl = root.querySelector<HTMLDivElement>('#status')!
 const metaEl = root.querySelector<HTMLParagraphElement>('#meta')!
@@ -50,6 +107,87 @@ let book: Book | null = null
 let rendition: Rendition | null = null
 let navLabels = new Map<string, string>()
 let currentLabel = 'idle'
+
+const callApi = async <T>(path: string, init: RequestInit = {}): Promise<T> => {
+  const headers = new Headers(init.headers ?? {})
+  if (init.body && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json')
+  }
+
+  if (session?.token) {
+    headers.set('Authorization', `Bearer ${session.token}`)
+  }
+
+  const response = await fetch(`${API_BASE}${path}`, { ...init, headers })
+  const parsed = (await response.json().catch(() => ({}))) as Record<string, unknown>
+  if (!response.ok) {
+    const message = typeof parsed.message === 'string' ? parsed.message : 'request failed'
+    throw new Error(message)
+  }
+
+  return parsed as T
+}
+
+const updateAuthUI = () => {
+  const authed = Boolean(session)
+  authShell.dataset.state = authed ? 'authed' : 'guest'
+  userGreeting.textContent = authed && session ? `hello, ${session.user.displayName}` : 'guest mode'
+  logoutBtn.hidden = !authed
+  fileInput.disabled = !authed
+  prevBtn.disabled = !authed
+  nextBtn.disabled = !authed
+  dropHint.textContent = authed ? 'drop your .epub anywhere' : 'sign in to drop your .epub anywhere'
+  authMessage.textContent = authed ? 'reader unlocked' : 'sign in to unlock the reader'
+}
+
+const persistSession = (payload: SessionPayload | null) => {
+  session = payload
+  if (payload) {
+    window.localStorage.setItem(SESSION_KEY, JSON.stringify(payload))
+  } else {
+    window.localStorage.removeItem(SESSION_KEY)
+  }
+  updateAuthUI()
+}
+
+const guardAuth = () => {
+  if (!session) {
+    authMessage.textContent = 'sign in first - then import'
+    setStatus('login required to open books')
+    return false
+  }
+
+  return true
+}
+
+const formToPayload = (form: HTMLFormElement) => {
+  const data = new FormData(form)
+  const payload: Record<string, string> = {}
+  data.forEach((value, key) => {
+    payload[key] = String(value).trim()
+  })
+  return payload
+}
+
+const bootstrapSession = async () => {
+  const stored = window.localStorage.getItem(SESSION_KEY)
+  if (!stored) {
+    updateAuthUI()
+    return
+  }
+
+  try {
+    const parsed = JSON.parse(stored) as SessionPayload
+    session = parsed
+    updateAuthUI()
+    const response = await callApi<{ user: AuthUser }>('/api/auth/me')
+    persistSession({ token: parsed.token, user: response.user })
+  } catch {
+    persistSession(null)
+  }
+}
+
+void bootstrapSession()
 
 const setStatus = (text: string) => {
   statusEl.textContent = text
@@ -210,6 +348,10 @@ const openBook = async (file: File) => {
 }
 
 const pickAndOpen = (files: FileList | null) => {
+  if (!guardAuth()) {
+    return
+  }
+
   if (!files?.length) {
     return
   }
@@ -223,15 +365,74 @@ fileInput.addEventListener('change', () => {
 })
 
 prevBtn.addEventListener('click', () => {
+  if (!guardAuth()) {
+    return
+  }
+
   void rendition?.prev()
 })
 
 nextBtn.addEventListener('click', () => {
+  if (!guardAuth()) {
+    return
+  }
+
   void rendition?.next()
 })
 
+registerForm.addEventListener('submit', (event) => {
+  event.preventDefault()
+  const payload = formToPayload(registerForm)
+  authMessage.textContent = 'creating account...'
+  setStatus('creating account...')
+
+  void callApi<SessionPayload>('/api/auth/register', {
+    method: 'POST',
+    body: JSON.stringify(payload)
+  })
+    .then((data) => {
+      persistSession(data)
+      authMessage.textContent = 'account ready - drop an epub'
+      registerForm.reset()
+    })
+    .catch((error) => {
+      const message = error instanceof Error ? error.message : 'registration failed'
+      authMessage.textContent = message
+      setStatus(message)
+    })
+})
+
+loginForm.addEventListener('submit', (event) => {
+  event.preventDefault()
+  const payload = formToPayload(loginForm)
+  authMessage.textContent = 'checking credentials...'
+  setStatus('signing in...')
+
+  void callApi<SessionPayload>('/api/auth/login', {
+    method: 'POST',
+    body: JSON.stringify(payload)
+  })
+    .then((data) => {
+      persistSession(data)
+      authMessage.textContent = 'signed in - import away'
+      loginForm.reset()
+    })
+    .catch((error) => {
+      const message = error instanceof Error ? error.message : 'login failed'
+      authMessage.textContent = message
+      setStatus(message)
+    })
+})
+
+logoutBtn.addEventListener('click', () => {
+  persistSession(null)
+  resetBook()
+  setMeta('no book loaded')
+  setStatus('signed out')
+})
+
 window.addEventListener('keydown', (event) => {
-  if (!rendition) {
+  if (!rendition || !session) {
     return
   }
 
@@ -252,6 +453,12 @@ const preventDefault = (event: Event) => {
 }
 
 const showDropState = () => {
+  if (!session) {
+    authMessage.textContent = 'sign in before dropping files'
+    setStatus('login required to drop files')
+    return
+  }
+
   document.body.classList.add('dragging')
   dropHint.dataset.visible = 'true'
 }
